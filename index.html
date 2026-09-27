@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Random Survey</title>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 36rem; margin: 20vh auto 0; padding: 0 1.5rem; color: #222; }
+    h2 { font-weight: 500; font-size: 1.25rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h2 id="message">Loading…</h2>
+
+  <script>
+    // ===== 1. Firebase 初始化 =====
+    const firebaseConfig = {
+      apiKey: "AIzaSyDwNLmo8CbUy_yz8Phay5ugxBVnsTWxrtc",
+      authDomain: "random-survey-abe86.firebaseapp.com",
+      projectId: "random-survey-abe86",
+      storageBucket: "random-survey-abe86.firebasestorage.app",
+      messagingSenderId: "586364937583",
+      appId: "1:586364937583:web:1b95dbb866c3305230f49a",
+      measurementId: "G-SC7Q6VY1RS"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.firestore();
+
+    // ===== 2. 研究設定（只需要改這一區）=====
+    const GROUP_COLLECTION  = "surveyGroups_study2";  // 分組計數
+    const ASSIGN_COLLECTION = "assignments_study2";   // 每個 PID 的分組紀錄
+    const perGroupLimit = 50;                         // 每組 50 份（要和 Rules 一致）
+    const urls = {
+      "A": "https://www.surveycake.com/s/1Qk6x",
+      "B": "https://www.surveycake.com/s/adgL4",
+      "C": "https://www.surveycake.com/s/krge4",
+      "D": "https://www.surveycake.com/s/7mZRA"
+    };
+
+    const FULL_MESSAGE =
+      "Thank you for your interest. This study is now full. " +
+      "Please return this study on Prolific (do not submit a completion code).";
+    const ERROR_MESSAGE =
+      "The survey could not load. Please refresh this page, or contact the researcher through Prolific.";
+
+    // ===== 3. Prolific 參數 → SurveyCake aka_ 格式 =====
+    const incoming = new URLSearchParams(window.location.search);
+    const pid = incoming.get("PROLIFIC_PID");
+
+    function buildQuery() {
+      const out = new URLSearchParams();
+      const map = {
+        PROLIFIC_PID: "aka_prolific_pid",
+        STUDY_ID: "aka_study_id",
+        SESSION_ID: "aka_session_id"
+      };
+      for (const [from, to] of Object.entries(map)) {
+        const v = incoming.get(from);
+        if (v) out.set(to, v);
+      }
+      const qs = out.toString();
+      return qs ? "?" + qs : "";
+    }
+
+    function goTo(group) {
+      window.location.replace(urls[group] + buildQuery());
+    }
+
+    function showMessage(text) {
+      document.getElementById("message").innerText = text;
+    }
+
+    // ===== 4. 倒數 3 秒，且只有頁面真正顯示時才開始 =====
+    function startCountdown() {
+      let count = 3;
+      showMessage(`Auto-assigning in ${count} seconds…`);
+      const interval = setInterval(() => {
+        count--;
+        if (count > 0) {
+          showMessage(`Auto-assigning in ${count} seconds…`);
+        } else {
+          clearInterval(interval);
+          assignGroup(0);
+        }
+      }, 1000);
+    }
+
+    function initWhenVisible() {
+      if (document.visibilityState === "visible") {
+        startCountdown();
+      } else {
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "visible") startCountdown();
+        }, { once: true });
+      }
+    }
+
+    // ===== 5. 分派邏輯 =====
+    async function assignGroup(attempt) {
+      try {
+        // 5-1 已經分過組的 PID → 送回原組，不重複計數
+        if (pid) {
+          const prev = await db.collection(ASSIGN_COLLECTION).doc(pid).get();
+          if (prev.exists && urls[prev.data().group]) {
+            goTo(prev.data().group);
+            return;
+          }
+        }
+
+        // 5-2 找出還沒滿 50 的組
+        const snapshot = await db.collection(GROUP_COLLECTION).get();
+        const open = [];
+        snapshot.forEach(doc => {
+          if (doc.data().count < perGroupLimit) open.push(doc.id);
+        });
+        if (open.length === 0) {
+          showMessage(FULL_MESSAGE);
+          return;
+        }
+
+        // 5-3 在未滿的組中隨機挑一組，計數 +1 並記錄 PID
+        const chosen = open[Math.floor(Math.random() * open.length)];
+        const groupRef = db.collection(GROUP_COLLECTION).doc(chosen);
+        const assignRef = pid ? db.collection(ASSIGN_COLLECTION).doc(pid) : null;
+
+        const finalGroup = await db.runTransaction(async (t) => {
+          const g = await t.get(groupRef);
+          const a = assignRef ? await t.get(assignRef) : null;
+          if (a && a.exists) return a.data().group;   // 同時開兩個分頁
+          if (g.data().count >= perGroupLimit) throw "Full";
+          t.update(groupRef, { count: g.data().count + 1 });
+          if (assignRef) {
+            t.set(assignRef, {
+              group: chosen,
+              assignedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+          }
+          return chosen;
+        });
+
+        goTo(finalGroup);
+      } catch (err) {
+        if (err === "Full" && attempt < 3) {
+          assignGroup(attempt + 1);                     // 剛好被搶滿 → 重挑
+        } else if (err === "Full") {
+          showMessage(FULL_MESSAGE);
+        } else {
+          console.error(err);
+          showMessage(ERROR_MESSAGE);
+        }
+      }
+    }
+
+    // ===== 6. 啟動 =====
+    initWhenVisible();
+  </script>
+</body>
+</html>
